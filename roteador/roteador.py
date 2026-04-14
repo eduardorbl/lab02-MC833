@@ -1,5 +1,9 @@
+import time
+
 from scapy.all import (
     IP,
+    TCP,
+    UDP,
     Raw,
     Ether,
     sniff,
@@ -27,8 +31,10 @@ IFACE_B = resolve_iface_by_ip("10.0.2.254")  # Rede B
 MAC_A = get_if_hwaddr(IFACE_A)
 MAC_B = get_if_hwaddr(IFACE_B)
 
-# Cache de MAC para não travar o roteador com requisições ARP lentas
 cache_mac = {}
+
+ALERT_AGGREGATION_WINDOW_SECONDS = 5
+alert_state = {}
 
 
 def match_hping3_repeated_x_120(payload):
@@ -56,16 +62,75 @@ def classify_payload(payload):
             return True, signature["name"], signature["reason"]
     return False, None, None
 
+
+def format_endpoint(pkt):
+    endpoint = pkt[IP].src if pkt.haslayer(IP) else "desconhecido"
+    if pkt.haslayer(TCP):
+        return f"{endpoint}:{pkt[TCP].sport}"
+    if pkt.haslayer(UDP):
+        return f"{endpoint}:{pkt[UDP].sport}"
+    return endpoint
+
+
+def format_destination(pkt):
+    endpoint = pkt[IP].dst if pkt.haslayer(IP) else "desconhecido"
+    if pkt.haslayer(TCP):
+        return f"{endpoint}:{pkt[TCP].dport}"
+    if pkt.haslayer(UDP):
+        return f"{endpoint}:{pkt[UDP].dport}"
+    return endpoint
+
+
+def alert_aggregation_key(pkt, signature_name):
+    src_ip = pkt[IP].src
+    dst_ip = pkt[IP].dst
+
+    if pkt.haslayer(TCP):
+        return ("TCP", src_ip, dst_ip, pkt[TCP].dport, signature_name)
+    if pkt.haslayer(UDP):
+        return ("UDP", src_ip, dst_ip, pkt[UDP].dport, signature_name)
+    return ("IP", src_ip, dst_ip, signature_name)
+
+
+def format_alert_message(src, dst, signature_name, reason, blocked_count):
+    return (
+        f"[ALERTA] origem={src} destino={dst} "
+        f"assinatura={signature_name} "
+        f"motivo={reason} "
+        f"pacotes_bloqueados={blocked_count} "
+        f"janela_s={ALERT_AGGREGATION_WINDOW_SECONDS}"
+    )
+
+
+def log_blocked_packet(pkt, signature_name, reason):
+    src = format_endpoint(pkt)
+    dst = format_destination(pkt)
+    key = alert_aggregation_key(pkt, signature_name)
+    now = time.monotonic()
+    state = alert_state.get(key)
+
+    if state is None:
+        print(format_alert_message(src, dst, signature_name, reason, 1))
+        alert_state[key] = {"last_log_at": now, "suppressed_count": 0}
+        return
+
+    if now - state["last_log_at"] >= ALERT_AGGREGATION_WINDOW_SECONDS:
+        blocked_count = state["suppressed_count"] + 1
+        print(format_alert_message(src, dst, signature_name, reason, blocked_count))
+        state["last_log_at"] = now
+        state["suppressed_count"] = 0
+        return
+
+    state["suppressed_count"] += 1
+
+
 def forward_packet(pkt):
-    # 1. Verificações básicas
     if not pkt.haslayer(IP) or not pkt.haslayer(Ether):
         return
 
-    # 2. Evitar loops (não processar o que o próprio roteador enviou)
     if pkt[Ether].src in [MAC_A, MAC_B]:
         return
 
-    # 3. Determinar interface de saída e MAC de origem
     dst_ip = pkt[IP].dst
     if dst_ip.startswith("10.0.1."):
         out_iface = IFACE_A
@@ -76,40 +141,32 @@ def forward_packet(pkt):
     else:
         return
 
-    # 4. Descobrir MAC de destino (quem deve receber o pacote na ponta final)
     mac_destino = cache_mac.get(dst_ip) or getmacbyip(dst_ip)
     if not mac_destino:
         return
     cache_mac[dst_ip] = mac_destino
 
-    # 5. Inspecionar payload e decidir se o pacote deve ser bloqueado.
     payload = extract_payload(pkt)
     is_malicious, signature_name, reason = classify_payload(payload)
     if payload and is_malicious:
-        print(
-            f"[ALERTA] Dropando pacote {pkt[IP].src} -> {pkt[IP].dst}: "
-            f"assinatura={signature_name} motivo={reason}"
-        )
+        log_blocked_packet(pkt, signature_name, reason)
         return
 
-    # 6. PREPARAÇÃO DO PACOTE PARA REENVIO
-    # Alteramos o cabeçalho Ethernet (L2) para o próximo salto
     pkt[Ether].src = mac_origem
     pkt[Ether].dst = mac_destino
-    
-    # Alteramos o IP (L3)
-    pkt[IP].ttl -= 1
-    
-    # FORÇAR RECALCULO DE CHECKSUM (Crucial para MariaDB/Telnet)
-    # Deletamos os campos antigos; o Scapy calcula os novos no sendp()
-    del pkt[IP].chksum
-    if pkt.haslayer('TCP'):
-        del pkt['TCP'].chksum
-    elif pkt.haslayer('UDP'):
-        del pkt['UDP'].chksum
 
-    # 7. ENVIAR VIA CAMADA 2
+    if pkt[IP].ttl <= 1:
+        return
+    pkt[IP].ttl -= 1
+
+    del pkt[IP].chksum
+    if pkt.haslayer(TCP):
+        del pkt[TCP].chksum
+    elif pkt.haslayer(UDP):
+        del pkt[UDP].chksum
+
     sendp(pkt, iface=out_iface, verbose=False)
 
+
 print(f"Roteador Scapy Ativo (L2 Mode) em {IFACE_A=} e {IFACE_B=}...")
-sniff(iface=[IFACE_A, IFACE_B], prn=forward_packet, store=0)
+sniff(iface=[IFACE_A, IFACE_B], filter="ip", prn=forward_packet, store=0)
