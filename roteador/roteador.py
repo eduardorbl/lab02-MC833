@@ -37,8 +37,10 @@ def extract_payload(pkt):
     return bytes(pkt[Raw].load)
 
 
-def is_malicious_payload(payload):
-    return len(payload) == 120 and payload == (b"X" * 120)
+def classify_payload(payload):
+    if len(payload) == 120 and payload == (b"X" * 120):
+        return True, "payload corresponde a assinatura do hping3"
+    return False, None
 
 def forward_packet(pkt):
     # 1. Verificações básicas
@@ -68,10 +70,11 @@ def forward_packet(pkt):
 
     # 5. Inspecionar payload e decidir se o pacote deve ser bloqueado.
     payload = extract_payload(pkt)
-    if payload and is_malicious_payload(payload):
+    is_malicious, reason = classify_payload(payload)
+    if payload and is_malicious:
         print(
             f"[ALERTA] Dropando pacote {pkt[IP].src} -> {pkt[IP].dst}: "
-            "payload corresponde a assinatura do hping3"
+            f"{reason}"
         )
         return
 
