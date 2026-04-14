@@ -31,6 +31,19 @@ MAC_B = get_if_hwaddr(IFACE_B)
 cache_mac = {}
 
 
+def match_hping3_repeated_x_120(payload):
+    return len(payload) == 120 and payload == (b"X" * 120)
+
+
+PAYLOAD_SIGNATURES = (
+    {
+        "name": "hping3_repeated_x_120",
+        "reason": "payload corresponde a assinatura do hping3",
+        "matcher": match_hping3_repeated_x_120,
+    },
+)
+
+
 def extract_payload(pkt):
     if not pkt.haslayer(Raw):
         return b""
@@ -38,9 +51,10 @@ def extract_payload(pkt):
 
 
 def classify_payload(payload):
-    if len(payload) == 120 and payload == (b"X" * 120):
-        return True, "payload corresponde a assinatura do hping3"
-    return False, None
+    for signature in PAYLOAD_SIGNATURES:
+        if signature["matcher"](payload):
+            return True, signature["name"], signature["reason"]
+    return False, None, None
 
 def forward_packet(pkt):
     # 1. Verificações básicas
@@ -70,11 +84,11 @@ def forward_packet(pkt):
 
     # 5. Inspecionar payload e decidir se o pacote deve ser bloqueado.
     payload = extract_payload(pkt)
-    is_malicious, reason = classify_payload(payload)
+    is_malicious, signature_name, reason = classify_payload(payload)
     if payload and is_malicious:
         print(
             f"[ALERTA] Dropando pacote {pkt[IP].src} -> {pkt[IP].dst}: "
-            f"{reason}"
+            f"assinatura={signature_name} motivo={reason}"
         )
         return
 
