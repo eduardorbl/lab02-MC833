@@ -74,11 +74,6 @@ def forward_packet(pkt):
             "payload corresponde a assinatura do hping3"
         )
         return
-    if payload:
-        print(
-            f"[INFO] Payload sem assinatura maliciosa: "
-            f"{pkt[IP].src} -> {pkt[IP].dst} (len={len(payload)})"
-        )
 
     # 6. PREPARAÇÃO DO PACOTE PARA REENVIO
     # Alteramos o cabeçalho Ethernet (L2) para o próximo salto
