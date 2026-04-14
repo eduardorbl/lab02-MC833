@@ -31,22 +31,19 @@ MAC_B = get_if_hwaddr(IFACE_B)
 cache_mac = {}
 
 
-def inspect_raw_layer(pkt):
-    print(f"[PKT] {pkt[IP].src} -> {pkt[IP].dst}")
+def extract_payload(pkt):
     if not pkt.haslayer(Raw):
-        print("Raw: ausente")
-        return
+        return b""
+    return bytes(pkt[Raw].load)
 
-    print("Raw: presente")
-    print("###[ Raw ]###")
-    print(f"  load      = {bytes(pkt[Raw].load)!r}")
+
+def is_malicious_payload(payload):
+    return len(payload) == 120 and payload == (b"X" * 120)
 
 def forward_packet(pkt):
     # 1. Verificações básicas
     if not pkt.haslayer(IP) or not pkt.haslayer(Ether):
         return
-
-    inspect_raw_layer(pkt)
 
     # 2. Evitar loops (não processar o que o próprio roteador enviou)
     if pkt[Ether].src in [MAC_A, MAC_B]:
@@ -69,7 +66,21 @@ def forward_packet(pkt):
         return
     cache_mac[dst_ip] = mac_destino
 
-    # 5. PREPARAÇÃO DO PACOTE PARA REENVIO
+    # 5. Inspecionar payload e decidir se o pacote deve ser bloqueado.
+    payload = extract_payload(pkt)
+    if payload and is_malicious_payload(payload):
+        print(
+            f"[ALERTA] Dropando pacote {pkt[IP].src} -> {pkt[IP].dst}: "
+            "payload corresponde a assinatura do hping3"
+        )
+        return
+    if payload:
+        print(
+            f"[INFO] Payload sem assinatura maliciosa: "
+            f"{pkt[IP].src} -> {pkt[IP].dst} (len={len(payload)})"
+        )
+
+    # 6. PREPARAÇÃO DO PACOTE PARA REENVIO
     # Alteramos o cabeçalho Ethernet (L2) para o próximo salto
     pkt[Ether].src = mac_origem
     pkt[Ether].dst = mac_destino
@@ -85,8 +96,7 @@ def forward_packet(pkt):
     elif pkt.haslayer('UDP'):
         del pkt['UDP'].chksum
 
-    # 6. ENVIAR VIA CAMADA 2
-    print(f"Encaminhando {pkt[IP].src} -> {pkt[IP].dst} via {out_iface}")
+    # 7. ENVIAR VIA CAMADA 2
     sendp(pkt, iface=out_iface, verbose=False)
 
 print(f"Roteador Scapy Ativo (L2 Mode) em {IFACE_A=} e {IFACE_B=}...")
