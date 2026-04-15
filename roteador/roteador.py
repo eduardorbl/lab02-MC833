@@ -80,13 +80,6 @@ SERVICE_PORTS = {
     3306: "mariadb",
 }
 
-TEXTUAL_PAYLOAD_MARKERS = (
-    ("http_get", lambda lowered: lowered.startswith("get ")),
-    ("telnet_username_aluno", lambda lowered: "aluno" in lowered),
-    ("telnet_password_lab123", lambda lowered: "lab123" in lowered),
-    ("telnet_command_ls", lambda lowered: "ls -la" in lowered),
-)
-
 
 def extract_payload(pkt):
     if not pkt.haslayer(Raw):
@@ -114,9 +107,30 @@ def decode_payload_text(payload):
     return decoded
 
 
-def sanitize_payload_example(text, limit=60):
+def format_payload_preview(text, limit=60):
     compact = text.replace("\r", "\\r").replace("\n", "\\n").strip()
     return compact[:limit]
+
+
+def get_transport_details(pkt):
+    if pkt.haslayer(TCP):
+        return pkt[TCP], "TCP", pkt[TCP].sport, pkt[TCP].dport
+    if pkt.haslayer(UDP):
+        return pkt[UDP], "UDP", pkt[UDP].sport, pkt[UDP].dport
+    return None, "IP", None, None
+
+
+def collect_textual_markers(lowered_text):
+    markers = set()
+    if lowered_text.startswith("get "):
+        markers.add("http_get")
+    if "aluno" in lowered_text:
+        markers.add("telnet_username_aluno")
+    if "lab123" in lowered_text:
+        markers.add("telnet_password_lab123")
+    if "ls -la" in lowered_text:
+        markers.add("telnet_command_ls")
+    return markers
 
 
 def observe_payload(payload):
@@ -143,11 +157,9 @@ def observe_payload(payload):
 
     if decoded_text is not None:
         lowered = decoded_text.lower()
-        for marker, matcher in TEXTUAL_PAYLOAD_MARKERS:
-            if matcher(lowered):
-                markers.add(marker)
+        markers.update(collect_textual_markers(lowered))
 
-        example = sanitize_payload_example(decoded_text)
+        example = format_payload_preview(decoded_text)
         if example:
             examples.append(example)
         kind = "textual"
@@ -228,30 +240,26 @@ def classify_payload(pkt, payload_info, now):
 
 def format_endpoint(pkt):
     endpoint = pkt[IP].src if pkt.haslayer(IP) else "desconhecido"
-    if pkt.haslayer(TCP):
-        return f"{endpoint}:{pkt[TCP].sport}"
-    if pkt.haslayer(UDP):
-        return f"{endpoint}:{pkt[UDP].sport}"
+    _transport, _protocol, sport, _dport = get_transport_details(pkt)
+    if sport is not None:
+        return f"{endpoint}:{sport}"
     return endpoint
 
 
 def format_destination(pkt):
     endpoint = pkt[IP].dst if pkt.haslayer(IP) else "desconhecido"
-    if pkt.haslayer(TCP):
-        return f"{endpoint}:{pkt[TCP].dport}"
-    if pkt.haslayer(UDP):
-        return f"{endpoint}:{pkt[UDP].dport}"
+    _transport, _protocol, _sport, dport = get_transport_details(pkt)
+    if dport is not None:
+        return f"{endpoint}:{dport}"
     return endpoint
 
 
 def alert_aggregation_key(pkt, signature_name):
     src_ip = pkt[IP].src
     dst_ip = pkt[IP].dst
-
-    if pkt.haslayer(TCP):
-        return ("TCP", src_ip, dst_ip, pkt[TCP].dport, signature_name)
-    if pkt.haslayer(UDP):
-        return ("UDP", src_ip, dst_ip, pkt[UDP].dport, signature_name)
+    _transport, protocol, _sport, dport = get_transport_details(pkt)
+    if dport is not None:
+        return (protocol, src_ip, dst_ip, dport, signature_name)
     return ("IP", src_ip, dst_ip, signature_name)
 
 
@@ -294,22 +302,14 @@ def ensure_data_file():
     write_csv_header()
 
 
-def get_transport_layer(pkt):
-    if pkt.haslayer(TCP):
-        return pkt[TCP], "TCP"
-    if pkt.haslayer(UDP):
-        return pkt[UDP], "UDP"
-    return None, "IP"
-
-
 def resolve_service(pkt):
-    transport, _protocol = get_transport_layer(pkt)
+    transport, _protocol, sport, dport = get_transport_details(pkt)
     if transport is None:
         return "unknown"
-    if transport.dport in SERVICE_PORTS:
-        return SERVICE_PORTS[transport.dport]
-    if transport.sport in SERVICE_PORTS:
-        return SERVICE_PORTS[transport.sport]
+    if dport in SERVICE_PORTS:
+        return SERVICE_PORTS[dport]
+    if sport in SERVICE_PORTS:
+        return SERVICE_PORTS[sport]
     return "unknown"
 
 
@@ -318,37 +318,7 @@ def classify_traffic(pkt, is_malicious, signature_name):
     src_ip = pkt[IP].src
     dst_ip = pkt[IP].dst
 
-    if is_malicious:
-        return {
-            "flow_id": f"attacker-{service}",
-            "service": service,
-            "direction": "attacker_to_server",
-            "traffic_class": "anomalous",
-            "decision": "blocked",
-            "signature_name": signature_name or "",
-        }
-
-    if src_ip == CLIENT_IP and dst_ip == SERVER_IP:
-        return {
-            "flow_id": f"client-{service}",
-            "service": service,
-            "direction": "client_to_server",
-            "traffic_class": "normal",
-            "decision": "forwarded",
-            "signature_name": "",
-        }
-
-    if src_ip == SERVER_IP and dst_ip == CLIENT_IP:
-        return {
-            "flow_id": f"server-{service}",
-            "service": service,
-            "direction": "server_to_client",
-            "traffic_class": "normal",
-            "decision": "forwarded",
-            "signature_name": "",
-        }
-
-    return {
+    metadata = {
         "flow_id": f"other-{service}",
         "service": service,
         "direction": "other",
@@ -356,6 +326,33 @@ def classify_traffic(pkt, is_malicious, signature_name):
         "decision": "forwarded",
         "signature_name": "",
     }
+
+    if is_malicious:
+        metadata.update(
+            {
+                "flow_id": f"attacker-{service}",
+                "direction": "attacker_to_server",
+                "traffic_class": "anomalous",
+                "decision": "blocked",
+                "signature_name": signature_name or "",
+            }
+        )
+    elif src_ip == CLIENT_IP and dst_ip == SERVER_IP:
+        metadata.update(
+            {
+                "flow_id": f"client-{service}",
+                "direction": "client_to_server",
+            }
+        )
+    elif src_ip == SERVER_IP and dst_ip == CLIENT_IP:
+        metadata.update(
+            {
+                "flow_id": f"server-{service}",
+                "direction": "server_to_client",
+            }
+        )
+
+    return metadata
 
 
 def get_metrics_key(protocol, metadata):
@@ -455,7 +452,7 @@ def record_packet_metrics(pkt, is_malicious, signature_name, payload_info):
     now = time.monotonic()
     flush_completed_windows(now)
 
-    _transport, protocol = get_transport_layer(pkt)
+    _transport, protocol, _sport, _dport = get_transport_details(pkt)
     metadata = classify_traffic(pkt, is_malicious, signature_name)
     bucket_index, window_start, window_end = get_bucket_window(now)
     key = get_metrics_key(protocol, metadata) + (bucket_index,)
@@ -513,12 +510,15 @@ def log_blocked_packet(pkt, signature_name, reason):
 
 
 def forward_packet(pkt):
+    # 1. Verificacoes basicas
     if not pkt.haslayer(IP) or not pkt.haslayer(Ether):
         return
 
+    # 2. Evitar loops (nao processar o que o proprio roteador enviou)
     if pkt[Ether].src in [MAC_A, MAC_B]:
         return
 
+    # 3. Determinar interface de saida e MAC de origem
     dst_ip = pkt[IP].dst
     if dst_ip.startswith("10.0.1."):
         out_iface = IFACE_A
@@ -529,11 +529,13 @@ def forward_packet(pkt):
     else:
         return
 
+    # 4. Descobrir MAC de destino (quem deve receber o pacote na ponta final)
     mac_destino = cache_mac.get(dst_ip) or getmacbyip(dst_ip)
     if not mac_destino:
         return
     cache_mac[dst_ip] = mac_destino
 
+    # 5. Inspecao de payload, decisao e registro de metricas
     now = time.monotonic()
     payload_info = observe_payload(extract_payload(pkt))
     is_malicious, signature_name, reason = classify_payload(pkt, payload_info, now)
@@ -542,6 +544,7 @@ def forward_packet(pkt):
         log_blocked_packet(pkt, signature_name, reason)
         return
 
+    # 6. Preparacao do pacote para reenvio
     pkt[Ether].src = mac_origem
     pkt[Ether].dst = mac_destino
 
